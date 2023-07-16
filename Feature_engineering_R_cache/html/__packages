@@ -1,0 +1,12 @@
+dplyr
+ggplot2
+rsample
+lattice
+caret
+h2o
+visdat
+recipes
+purrr
+tidyr
+readr
+kableExtra

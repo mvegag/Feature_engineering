@@ -1,0 +1,701 @@
+---
+title: 'Machine learning con R - Preparación de datos'
+author: 'Mateo Vega'
+format: 
+  html:
+    self-contained: true
+---
+
+## Capitulo 2 - Proceso de modelamiento
+
+### Paquetes que se van a usar 
+
+```{r}
+#| output: false
+
+# datasets principales
+
+ames = AmesHousing::make_ames()
+attrition =  modeldata::attrition
+mnist = dslabs::read_mnist()
+url <- "https://koalaverse.github.io/homlr/data/my_basket.csv"
+basket = readr::read_csv(url)
+
+library(dplyr)
+library(ggplot2)
+
+# para modelamiento
+library(rsample)
+library(caret)
+library(h2o)
+
+# establecer h2o
+h2o.no_progress()
+h2o.init()
+```
+
+Mucha parte de machine learning está hecha con el paquete H2o, por lo tanto es mejor convertir los data sets a objetos H2O, H2O no maneja dactores ordenados, por lo tanto hay que arreglarlos antes de convertirlos.
+
+```{r}
+ames.h2o = as.h2o(ames)
+
+churn = attrition %>%
+  mutate_if(is.ordered, .funs = factor, ordered = F)
+churn.h2o = as.h2o(churn)
+```
+
+### Separar datos
+
+Necesitamos un algoritmo $f(x)$ que prediga con precición valores futuros $\hat{Y}$ basado en algunos features $X$, queremos un algoritmo que funcione bien en nuestros datos pasados y que prediga el futuro con exactitud, esto se llama la generalizabilidad de nuestro algoritmo, para esto separamos nuestros datos en entrenamiento y prueba:
+
+-   Entrenamiento: se usan para generar el conjunto de categorias, entrenar el algoritmo, sintonizar hiperparámetros, comparar modelos y el resto de actividades para escoger un modelo final.
+-   Prueba: Si ya se tiene el modelo final, se usan para generar una evaluación del rendimiento del modelo.
+
+Se recomienda separar en 70-30 o 80-20, mucho entrenamiento no nos daría buenas evaluaciones y mucha prueba no nos dejaría encontrar los mejores parámetros del modelo, las dos formas más comunes de separar los datos son el muestreo aleatorio simple y el muestreo estratificados.
+
+#### Muestreo aleatorio simple
+
+Este método no tiene en cuenta ningún atributo de los datos,
+
+```{r}
+# R base
+set.seed(1234)
+index_1 = sample(1:nrow(ames), round(nrow(ames) * 0.7))
+train_1 = ames[index_1, ]
+test_1 = ames[-index_1, ]
+
+# Usando Caret
+index_2 = createDataPartition(ames$Sale_Price, p = 0.7,
+                              list = F)
+train_2 = ames[index_2, ]
+test_2 = ames[-index_2, ]
+
+# usando rsample
+split_1 = initial_split(ames, prop = 0.7)
+train_3 = training(split_1)
+test_3 = testing(split_1)
+
+# Usando h2o
+split_2 = h2o.splitFrame(ames.h2o, ratios = 0.7,
+                         seed = 123)
+train_4 = split_2[[1]]
+test_4 = split_2[[2]]
+```
+
+Con el suficiente tamaño de muestra las distribuciones de los métodos va a ser casi la misma.
+
+#### Muestreo estratificado
+
+Se usa si queremos controlar que nuestros datos de entrenamiento y prueba tengan distribuciones similares de $Y$, común en problemas de clasificación donde la variable respuesta está muy desbalanceada (90% si 10% no), igualmente para regresión si en una muestra pequeña la variable respuesta se aleja de la normalidad.
+
+```{r}
+# distribución de la variable attrition
+
+table(churn$Attrition) %>% prop.table()
+```
+
+```{r}
+# muestreo estratificado
+
+set.seed(123)
+split_strat = initial_split(churn, prop = 0.7,
+                            strat = 'Attrition')
+train_strat = training(split_strat)
+test_strat = testing(split_strat)
+```
+
+```{r}
+# distribución
+table(train_strat$Attrition) %>% prop.table()
+```
+
+```{r}
+table(test_strat$Attrition) %>% prop.table()
+```
+
+#### Clases desbalanceadas
+
+Se tiene cuando una clase tiene una proporción muy baja de observaciones (5% default vs 95% no default), esto se puede solucionar con muchos métodos, aquí se presentan *up-sampling* y *down-sampling*.
+
+*Down-sampling* balancea el conjunto de datos reduciendo el tamaño de la clase abundante, este método se usa cuando la cantidad de datos son suficientes.
+
+*Up-sampling* se usa cuando la cantidad de datos es insuficiente, balancea el conjunto de datos incrementando el tamaño de las muestras raras, se generan nuevas muestras raras usando repetición o bootstraping.
+
+También se puede juntar los dos, *Synthetic Minority Over-Sampling (SMOTE)*, ver  `?caret::trainControl()`, `h2o::weights_column`, `h2o::balance_classes`.
+
+### Creando modelos con R
+
+#### Formas de crear una formula
+
+Suponiendo que `model_fn()` es una función que recibe una formula, hay varias formas de crear un modelo:
+
+```{r}
+#| eval: false
+
+# precio en funcion del barrio y del año
+model_fn(Sale_Price ~ Neighborhood + Year_Sold,
+         data = ames)
+
+# variables + interacción
+model_fn(Sale_Price ~ Neighborhood + Year_Sold +
+           Neighborhood:Year_Sold, data = ames)
+
+# todos los predictores
+model_fn(Sale_Price ~ ., data = ames)
+
+# Funciones en linea
+model_fn(log10(Sale_Price) ~ ns(Longitude, df = 3) +
+           ns(Latitude, df = 3), data = ames)
+```
+
+### Métodos de re muestreo
+
+Para medir el desempeño de nuestro modelo en la fase de entrenamiento usamos un método de validación, este se basa en separar los datos de entrenamiento para crear dos partes: entrenamiento y validación. Entrenamos el modelo en los datos de entrenamiento y estimamos el rendimiento en los datos de validación, esto puede ser malo si tenemos una muestra pequeña. Para esto usamos metodos de re muestreo, los métodos mas comúnes son *validación cruzada k-fold* y *bootstraping*.
+
+
+#### Validación cruzada k-fold
+
+Este método divide al azar el conjunto de entrenamiento en k grupos (folds) de casi el mismo tamaño, el modelo se ajusta en k - 1 grupos y el restante se usa para medir el rendimiento, este proceso se repite k veces, cada vez el grupo de validación cambia, esto resulta en k estimaciones de la generalización del error, se estima el promedio de estos y obtenemos una aproximación al error, se ha encontrado que k = 10 es de los más óptimos, este método tiene más variabilidad que *bootstraping*.
+
+```{r}
+#| eval: false
+h2o.cv = h2o.glm(
+  x = x,
+  y = y,
+  training_frame = ames.h2o,
+  nfolds = 10
+)
+```
+O se puede hacer a parte,
+
+```{r}
+vfold_cv(ames, v = 10)
+```
+
+#### Bootstraping
+
+Es un muestreo aleatorio de los datos con reemplazo, el tamaño de muestra del bootstrap es el mismo que el conjunto de donde se sacó, los datos que no queden en la muestra se consideran *out-of-bag* (OOB), estos se pueden usar como datos de validación.
+
+En muestras pequeñas debido a la repetición se puede generar sesgo, para $n \geq 1000$ el sesgo es mucho menor.
+
+
+```{r}
+bootstraps(ames, times = 10)
+```
+
+
+#### Sesgo contra varianza
+
+Sesgo es la diferencia entre la predicción esperada de nuestro modelo y el valor correcto que estámos tratando de predecir, mide que tan lejos estamos de los valores correctos.
+
+Varianza es la variabilidad de la predicción de un modelo para unos datos dados, modelos con mucha varianza son más probables de sufrir sobrejauste.
+
+
+#### Sintonizar hiperparámetros
+
+Los hiperparámetros son los ajustes para controlar la complejidad de los algoritmos de machine learning, no todos los algoritmos tienen hiperparámetros pero la mayoria si.
+
+La mejor forma de sintonizar estos hiperparámetros es con una *grid search*, una busqueda automática de muchas combinaciones de hiperparámetros.
+
+### Evaluación de modelos
+
+La manera más efectiva de evaluar un modelo es a través de la función de perdida, las funciones de perdida son metricas que comparan el valor predicho con el valor real.
+
+#### Métricas
+
+- **MSE:** $MSE = \frac{1}{n}\sum_{i=1}^n(y_i - \hat{y}_i)^2$, es el promedio de los errores al cuadrado. **Objetivo: minimizar**.
+
+- **RMSE** = $RMSE = \sqrt{\frac{1}{n}\sum_{i=1}^n(y_i - \hat{y}_i)^2}$, toma la raiz del anterior para que la métrica tenga la misma unidad que la variable respuesta. **Objetivo: minimizar**.
+
+- **Devianza:** Presenta el grado al cual un modelo explica la variación de un conjunto de datos usando estimación de máxima verosimilitúd, compara el modelo saturado con el modelo no saturado, **Objetivo: minimizar**.
+
+- **MAE:** Error medio absoluto, $MAE = \frac{1}{n}\sum_{i=1}^n(|y_i - \hat{y}_i|)$, menos enfasis en errores muy grandes, **Objetivo: minimizar**.
+
+- **RMSLE:** Raiz del cuadrado medio del error logarítmico, $RMSLE = \sqrt{\frac{1}{n}\sum_{i=1}^n(log(y_i + 1) - log(\hat{y}_i + 1))^2}$, se usa cuando la variable respuesta tiene un rango muy grande, **Objetivo: minimizar**.
+
+- **$R^2$:** proporción de la varianza en la variable dependiente explicada por el modelo, no hay que poner mucho cuidado en esta metrica, **Objetivo: maximizar**.
+
+### Para modelos de clasificación
+
+- **mala clasificación:** El error generalel porcentaje de observaciones mal clasificadas, por ejemplo se tienen 3 clases con 25, 30, 35 observaciones, si se clasifican mal 3, 6, 4, respectivamente la métrica es $\frac{13}{90}$, 14%, **Objetivo: minimizar**.
+
+- **Error medio por clase:** El error promedio para cada clase, por ejemplo, la media de $\frac{3}{25}, \frac{6}{30}, \frac{4}{35}$, 14.5%, **Objetivo: minimizar**.
+
+- **MSE:** Error cuadrado medio, computa la distancia de 1 a la probabilidad sugerida, por ejemplo, tenemos tres clases y el modelo predice probabilidades de 0.91, 0.07, 0.02, si la respuesta correcta es la primer clase entonces $MSE = 0.09^2$, si la respuesta correcta es la segunda clase, entonces $MSE = 0.93^2$, **Objetivo: minimizar**.
+
+- **Cross-entropy:** Similar al MSE pero incopora logaritmo a la probabilidad predicha multiplicada por la clase verdadera, **Objetivo: minimizar**.
+
+- **Indice de Gini:** Usada principalmente en métodos de árboles, se refiere a la pureza donde un valor pequeño indica que un nodo contiene observaciones predominantes de una sola clase, **Objetivo: minimizar**.
+
+
+Ahora, dada la matriz de confusión se pueden obtener las siguientes métricas:
+
+
+- **Accuracy (Exactitud):** Que tan seguido es el modelo correcto? $\frac{TP+TN}{total}$, **Objetivo: maximizar**.
+- **Precision:** Que tan exacto el modelo predice eventos? Se preocupa por maximizar la proporción de positivos verdaderos (TP) frente a falsos positivos (FP), de las predicciones que hicimos, cuantas fueron correctas? $\frac{TP}{TP + FP}$, **Objetivo: maximizar**. 
+- **Specificity (recall):** Que tan exacto el modelo clasifica eventos reales? se busca maximizar la proporción de verdaderos positivos frente a falsos negativos, de los eventos que ocurrieron, cuantos predijimos? $\frac{TP}{TP+FN}$, **Objetivo: maximizar**. 
+- **Specificity:** Que tan exacto el modelo clasifica no eventos reales, $\frac{TN}{TN+FP}$, **Objetivo: maximizar**. 
+- **AUC:** Area debajo de la curva, un buen clasificador tienen alta precisión y sensitividad, el modelo clasifica bien cuando predice un evento y cuando no va a suceder, minimiza falsos positivos y falsos negativos, para capturar este balance usamos una curva ROC que grafica el porcentaje de falsos positivos en el eje x y los verdaderos positivos en el eje y, la linea diagonal dice que nuestro modelo no es mejor que adivinar, entre más cerca la linea a la esquina izquierda de arriba, mejor. 
+
+
+### Ejemplo del proceso
+
+Primero hacemos un muestreo estratificado con el paquete rsample
+
+```{r}
+set.seed(123)
+split = initial_split(ames, prop = 0.7, 
+                      strata = 'Sale_Price')
+ames_train = training(split)
+ames_test = testing(split)
+```
+Se hace una regresión KNN a nuestros datos usando caret usando los siguientes pasos:
+
+1. **Metodo de re muestreo:** usamos un CV - 10 fold repetido 5 veces.
+1. **Grid search:** especificamos los hiperparámetros a buscar $(k = 2, 3, 4, \dots, 25)$.
+1. **Entrenamiento de modelo y validación:** entrenamos el modelo knn y usamos la metrica RMSE.
+
+```{r}
+#| cache: true
+
+# especificar estrategia de re muestreo
+cv = trainControl(
+  method = 'repeatedcv',
+  number = 10,
+  repeats = 5
+)
+
+# crear una cuadricula de hiperparámetros
+hyper_grid = expand.grid(k = seq(2, 25, by = 1))
+
+# sintonizar un modelo knn usando la cuadricula
+knn_fit = train(
+  Sale_Price ~ ., 
+  data = ames_train,
+  method = 'knn',
+  trControl = cv,
+  tuneGrid = hyper_grid,
+  metric = 'RMSE'
+)
+```
+
+```{r}
+knn_fit
+```
+
+
+Encontramos un k óptimo igual a 6, con un $RMSE = 43846.05$.
+
+```{r}
+ggplot(knn_fit)
+```
+
+
+## Capitulo 3 - Feature engineering
+
+En esta parte se pre procesan los datos, diferentes modelos tienen diferentes necesidades para funcionar mejor. En este capitulo se aplican estas técnicas.
+
+```{r}
+#| output: false
+# Helper packages
+library(dplyr)    # for data manipulation
+library(ggplot2)  # for awesome graphics
+library(visdat)   # for additional visualizations
+
+# Feature engineering packages
+library(caret)    # for various ML tasks
+library(recipes)  # for feature engineering tasks
+
+# adicionales
+library(purrr)
+library(tidyr)
+library(readr)
+library(kableExtra)
+```
+
+### Transformaciones
+
+Por ejemplo, la regresión lineal ordinal asume que los errores y la variable respuesta está distribuida normal, a veces una simple transformación logaritmica puede transformar la variable a una distribución normal,
+
+```{r}
+modelos = c('Residuales del modelo sin transformar', 
+            'Residuales del modelo con transformación logaritmica')
+list(
+  m1 = lm(Sale_Price ~ Year_Built, data = ames_train),
+  m2 = lm(log(Sale_Price ) ~ Year_Built, data = ames_train)
+) %>%
+  map2_dfr(modelos, ~ broom::augment(.x) %>% mutate(model = .y)) %>%
+  ggplot(aes(.resid)) +
+    geom_histogram(bins = 75) +
+    facet_wrap(~ model, scales = 'free_x') +
+    ylab(NULL) +
+    xlab('Residuales')
+```
+
+Vemos que después de la transformación logaritmica los residuos parecen distribuirse de forma más normal, para datos con sesgo positivo hay dos opciones:
+
+- **Opcion 1:** Normalizar con una transformación log,
+
+```{r}
+variable_transformada = log(ames_train$Sale_Price)
+```
+
+Sin embargo se quiere representar el pre procesamiento como un plano de lo que hacemos para que se puede re utilizar, para esto usamos la libreria `recipe`,
+
+```{r}
+ames_recipe = recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_log(all_outcomes())
+ames_recipe
+```
+Esta transformación logartimica solo se puede hacer para valores positivos, si los valores toman valores entre (-0.99 y 0), podemos sumar 1 y hacer la transformación `log1p()`, si los valores son menores a -1, se puede usar la transformación Yeo-Johnson.
+
+```{r}
+log(-0.5)
+log1p(-0.5)
+```
+- **Opción 2:** Usar la transformación Box Cox, esta trata de aproximar los datos a una distribución normal
+
+```{r}
+# Log transformation
+train_log_y <- log(ames_train$Sale_Price)
+test_log_y  <- log(ames_train$Sale_Price)
+
+# Box Cox transformation
+lambda  <- forecast::BoxCox.lambda(ames_train$Sale_Price)
+train_bc_y <- forecast::BoxCox(ames_train$Sale_Price, lambda)
+test_bc_y  <- forecast::BoxCox(ames_test$Sale_Price, lambda)
+
+# Plot differences
+levs <- c("Normal", "Log_Transform", "BoxCox_Transform")
+data.frame(
+  Normal = ames_train$Sale_Price,
+  Log_Transform = train_log_y,
+  BoxCox_Transform = train_bc_y
+) %>%
+  gather(Transform, Value) %>%
+  mutate(Transform = factor(Transform, levels = levs)) %>% 
+  ggplot(aes(Value, fill = Transform)) +
+    geom_histogram(show.legend = FALSE, bins = 40) +
+    facet_wrap(~ Transform, scales = "free_x")
+```
+
+### Valores perdidos
+
+Hay dos grandes razones para los datos perdidos:
+
+- Valores perdidos informativos: Aca el valor perdido tiene sentido, se podría pensar en crear una categoria para estos datos.
+- Valores perdidos aleatorios: Estos datos son independientes de la recolección, son valores perdidos de verdad y se deberían imputar.
+
+#### Visualizar valores perdidos
+
+Es importante entender la distribución de los datos perdidos
+
+```{r}
+sum(is.na(AmesHousing::ames_raw))
+```
+Ahora para ver la dsitribución,
+
+```{r}
+AmesHousing::ames_raw %>%
+  is.na() %>%
+  reshape2::melt() %>%
+  ggplot(aes(Var2, Var1, fill = value)) +
+    geom_raster() +
+    coord_flip() + 
+    scale_y_continuous(NULL, expand = c(0, 0)) +
+    scale_fill_grey(name = '',
+                    labels = c('Presente',
+                               'Perdido')) +
+    xlab('Observaciones') +
+    theme(axis.text.y = element_text(size = 4))
+```
+
+En este caso la variable `Garage_xx` tiene muchos NA, tal vez no sabían como clasificar las casas sin garage, en este caso sería mejor reemplazar los NA con su propia categoria 'None'.
+
+```{r}
+AmesHousing::ames_raw %>%
+  filter(is.na(`Garage Type`)) %>%
+  select(`Garage Type`, `Garage Cars`, `Garage Area`)
+```
+
+Otra forma de visualizarlo,
+
+```{r}
+vis_miss(AmesHousing::ames_raw, cluster = T)
+```
+
+#### Imputación
+
+Es el proceso de reemplazar valores perdidos con un sustituto, hay varios métodos.
+
+##### Con un valor fijo
+
+La forma más sencilla es con una valor fijo como la media, la mediana o la moda, aunque fácil este método no tiene enc cuenta los atributos de los datos, no es aconsejable usarlo, importante recordar que la imputación deber ser hecha dentro del proceso de re muestreo.
+
+
+```{r}
+ames_recipe %>%
+  step_impute_median(Gr_Liv_Area)
+```
+##### KNN
+
+Identifica los valores más parecidos al valor perdido con respecto a otras categorias, este método es bastante pesado para conjuntos de datos muy grandes.
+
+```{r}
+ames_recipe %>%
+  step_impute_knn(all_predictors(), neighbors = 5)
+```
+##### Basado en árboles
+
+```{r}
+ames_recipe %>% 
+  step_impute_bag(all_predictors())
+```
+
+### Filtrado de features
+
+Es muy importante filtrar las variables que realmente sirven para el modelo, aunque algunos modelos no sufren tanto por variables no informativas la computación puede volverse pesada.
+
+Las primeras variables que debemos eliminar son las que tengan varianza cero o casi cero, no aportan información importante al modelo, para detectar variables con varianza casi cero se puede tener en cuenta:
+
+- La fracción de valores únicos es baja (menos de 10%).
+- El radio de la frecuencia del valor más prevalente al segundo más prevalente es grande (mas de 20%).
+
+Si ambos criterios son verdad es mejor quitar las variables del modelo, por ejemplo,
+
+
+```{r}
+caret::nearZeroVar(ames_train, saveMetrics = T) %>%
+  tibble::rownames_to_column() %>%
+  filter(nzv)
+```
+
+Podemos usar `step_nzv` o `step_zv` para quitar estas variables.
+
+#### Variables numericas
+
+Las variables numericas pueden crear problemas cuando tienen sesgo, contienen outliers o tienen muchos rangos, esto se puede arreglar en parte normalizando y estandarizando variables con mucho sesgo/
+
+#### Sesgo 
+
+Los modelos parámetricos necesitan el supuesto de normalidad, cuando se normalizan variables es mejor usa Box Cox o Yeo Johnson.
+
+
+```{r}
+recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_YeoJohnson(all_numeric())
+```
+#### Estandarización
+
+Para algunos modelos es mejor estandarizar las variables para que queden en una unidad comparable con media cero y varianza unitarias, se debe estandarizar en el plano para que los datos de entrenamiento y prueba tengan la misma media y varianza y se minimize la perdida de datos.
+
+```{r}
+ames_recipe %>% 
+  step_center(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes())
+```
+
+### Variables categóricas
+
+
+#### Agrupar 
+
+Cuando se tienen variables con niveles con pocas observaciones, por ejemplo en ames hay 28 barrios únicos,
+
+
+```{r}
+count(ames_train, Neighborhood) %>% arrange(n)
+```
+
+```{r}
+count(ames_train, Screen_Porch) %>% arrange(n)
+```
+
+Es mejor agrupar estas categorias con pocos valores en una nueva categoria, por ejemplo los niveles con menos del 10% de la muestra.
+
+```{r}
+ames_train$Screen_Porch = as.factor(ames_train$Screen_Porch)
+lumping <- recipe(Sale_Price ~ ., data = ames_train) %>%
+    step_other(Neighborhood, threshold = 0.01, 
+               other = "other")
+
+# aplicarlo el plano 
+
+apply_2_training <- prep(lumping, training = ames_train) %>%
+    bake(ames_train)
+
+count(apply_2_training, Neighborhood) %>% arrange(n)
+```
+
+#### One hot y codificación dummy
+
+Muchos modelos necesitan que todas las variables sean numericas, por lo tanto se transforman las variables categóricas a numericas, el one hot transforma la variable categorica para que cada nivel de la variable sea representada por un booleano, esto causa colinealidad, por lo tanto se quita un nivel, esto es la codificacion dummy.
+
+```{r}
+recipe(Sale_Price ~., data = ames_train) %>%
+  step_dummy(all_nominal(), one_hot = T)
+```
+Si se tienen variables con muchas categorias la dimensión del conjunto de datos se aumenta mucho, ahí sería mejor una codificación ordianl u otras alternativa.
+
+#### Codificación de etiquetas
+
+Es una organización numerica de una variable categorica, puede ser en orden u orden alfabetico,
+
+```{r}
+count(ames_train, MS_SubClass)
+```
+```{r}
+# codificado
+
+recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_integer(MS_SubClass) %>%
+  prep(ames_train) %>%
+  bake(ames_train) %>%
+  count(MS_SubClass)
+```
+
+Hay que tenre cuidado ya que se transforma a una variable ordinal, si la categorica no tiene orden esto no tendría sentido, si la variable categórica tiene un orden entonces es directa la transformación.
+
+```{r}
+ames_train %>% select(contains('Qual'))
+```
+
+Estas variables pueden transformarse a una variable ordinal.
+
+```{r}
+count(ames_train, Overall_Qual)
+```
+
+```{r}
+recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_integer(Overall_Qual) %>%
+  prep(ames_train) %>%
+  bake(ames_train) %>%
+  count(Overall_Qual)
+```
+
+### Reducción de dimensión
+
+```{r}
+# pca
+recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_center(all_numeric()) %>%
+  step_scale(all_numeric()) %>%
+  step_pca(all_numeric(), threshold = 0.95)
+```
+### Implementación
+
+- Si se va a usar Box Cox que sea antes de centrar los datos ya que eso volveria los datos negativos, o se puede usar Yeo Johnson.
+- One hot o dummy resulta en datos sparse, si se estandariza despues se queda con datos densos, y se pierde la eficiencia computacional, es mejor estandarizar primero y despues hacer la codificacion.
+- Si se agrupan categoriasinfrecuentes juntas, hacerlo antes de la one hot / dummy.
+- Primero se hace la reducción de dimensión en variables numéricas.
+
+
+Un paso a paso puede ser:
+
+1. Filtrar variables con varianza cero o casi cero.
+1. Hacer imputación.
+1. Normalizar para resolver sesgo numerico.
+1. Estandarizar variables numericas.
+1. Hace reducción de dimensión en variables numericas.
+1. One hot o Dummy codificación en variables categoricas.
+
+
+### Fuga de datos
+
+La fuga de datos pasa en el pre procesamiento de los datos, para minimizar esto se debe hacer este feature engineering isolado de cada iteración de remuestreo, por ejemplo, cada datos de entrenamiento re muestreado debe usar su propia media y varianza y estos valores aplicarlos a los datos de prueba.
+
+
+### Ejemplo del proceso
+
+
+Primero una introducción del paquete recipe, hay tres pasos:
+
+1. `recipe`: defines tus pasos de feature engineering para crear el plano.
+1. `prep`: estimar parámetros de feature engineering basado en los datos de entrenamiento.
+1. `bake`: aplicar el plano a nuevos datos.
+
+Por ejemplo: 
+
+1. Eliminar variables con varianza cero.
+1. Codificar nuestras variables ordinales (las que tienen sentido).
+1. Centrar y escalar (estandarizar) todas las variables numericas.
+1. Reducir dimensión aplicando PCA a las variables numericas.
+
+```{r}
+plano = recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_nzv(all_nominal()) %>%
+  step_integer(matches('Qual|Cond|QC|Qu')) %>%
+  step_center(all_numeric(), - all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  step_pca(all_numeric(), -all_outcomes())
+
+plano
+```
+Luego se entrena el plano en los datos de entrenamiento
+
+```{r}
+prepare = prep(plano, training = ames_train) 
+prepare
+```
+Por ultimos aplicamos el plano a datos nuevos
+
+```{r}
+baked_train = bake(prepare, new_data = ames_train)
+baked_test = bake(prepare, new_data = ames_test)
+baked_train
+```
+
+Ahora, la meta es desarrollar el plano y con cada iteracion del remuestreo aplicar prep y bake a nuestros datos de entrenamiento remuestreados, el paquete caret hace esto por nosotros.
+
+```{r}
+plano = recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_nzv(all_nominal()) %>%
+  step_integer(matches('Qual|Cond|QC|Qu')) %>%
+  step_center(all_numeric(), - all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = T)
+```
+
+Luego aplicamos el metodo de remuestreo y la busqueda de hiperparámetros,
+
+```{r}
+#| cache: true
+
+# especificar el plan de remuestreo
+cv = trainControl(
+  method = 'repeatedcv',
+  number = 10,
+  repeats = 5
+)
+
+# Construir la cuadricula de los valores de hiperparámetros
+hyper_grid = expand.grid(k = seq(2, 25, by = 1))
+
+# sintonizar un modelo knn usando la busqueda de cuadricula
+knn_fit2 = train(
+  plano, 
+  data = ames_train,
+  method = 'knn',
+  trControl = cv,
+  tuneGrid = hyper_grid,
+  metric = 'RMSE'
+)
+```
+
+Mostramos ahora los resultados,
+
+```{r}
+knn_fit2
+```
+
+
+```{r}
+ggplot(knn_fit2)
+```
+
+Se redujo el error por más de 10000 dólares.
+
+
+
+
